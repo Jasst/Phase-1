@@ -133,7 +133,7 @@ class LMBackend:
 
     # ---------- промпт ----------
 
-    def _messages(self, question, ctx, memory=()):
+    def _messages(self, question, ctx, memory=(), note=""):
         system = SYSTEM_PROMPT
         clean_ctx = [str(x).strip() for x in ctx if str(x).strip()]
         if clean_ctx:
@@ -141,6 +141,8 @@ class LMBackend:
         clean_mem = [str(m).strip() for m in memory if str(m).strip()]
         if clean_mem:
             system += " " + MEMORY_NOTE + " ".join(clean_mem[:3])
+        if note:
+            system += " " + str(note).strip()
         messages = [{"role": "system", "content": system}]
         for user_text, assistant_text in self.history[-HISTORY_TURNS:]:
             messages.append({"role": "user", "content": user_text})
@@ -217,7 +219,7 @@ class LMBackend:
                 if delta:
                     yield delta
 
-    def stream(self, question, ctx=(), memory=(), should_stop=lambda: False):
+    def stream(self, question, ctx=(), memory=(), should_stop=lambda: False, note=""):
         """Генератор (текст, готово). Текст — весь ответ, очищенный от think.
 
         should_stop() проверяется на каждом фрагменте: при True генерация
@@ -227,7 +229,7 @@ class LMBackend:
             yield "", True
             return
         with self._gen_lock:
-            messages = self._messages(question, list(ctx or ()), list(memory or ()))
+            messages = self._messages(question, list(ctx or ()), list(memory or ()), note)
             source = (self._stream_llamacpp if BACKEND == "llamacpp"
                       else self._stream_lmstudio)
             raw, count, t0 = "", 0, time.time()
@@ -293,11 +295,12 @@ class LMWorker:
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def submit(self, question, ctx=(), memory=()):
+    def submit(self, question, ctx=(), memory=(), note="", remember=True):
         with self._lock:
             self._last_id += 1
             request_id = self._last_id
-            self._job = (request_id, str(question), tuple(ctx or ()), tuple(memory or ()))
+            self._job = (request_id, str(question), tuple(ctx or ()), tuple(memory or ()),
+                         str(note or ""), bool(remember))
             self._result = None
             self._partial = (request_id, "")
         self._wake.set()
@@ -332,12 +335,12 @@ class LMWorker:
             if job is None:
                 continue
 
-            request_id, question, context, memory = job
+            request_id, question, context, memory, note, remember = job
             answer = ""
             try:
                 for text, done in self.backend.stream(
                     question, context, memory,
-                    should_stop=lambda: self._cancelled(request_id),
+                    should_stop=lambda: self._cancelled(request_id), note=note,
                 ):
                     with self._lock:
                         if request_id == self._last_id:
@@ -350,6 +353,6 @@ class LMWorker:
 
             with self._lock:
                 if request_id == self._last_id:
-                    if answer:
+                    if answer and remember:
                         self.backend.remember_exchange(question, answer)
                     self._result = (request_id, answer)

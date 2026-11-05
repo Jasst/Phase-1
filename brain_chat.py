@@ -11,6 +11,7 @@ import pygame
 from mind import Mind
 from lm_backend import LMBackend, LMWorker
 from episodes import EpisodeMemory, RECALL_STRONG, RECALL_WEAK
+from reasoning import Answerer
 
 W, H = 1280, 800
 CHAT_W = 420
@@ -97,6 +98,8 @@ C_THOUGHT = (150, 158, 172)
 C_FOCUS = (236, 200, 120)     # подсветка нейрона под курсором
 LABEL_ALL = 140              # при таком размере сети подписи видны у всех слов
 COH_HIST = 120               # точек на графике согласованности
+HOT_NODE = 30               # кадров подсветки нейрона после спайка (~3 с)
+HOT_LINK = 20               # кадров подсветки связи (~2 с)
 
 
 
@@ -821,7 +824,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
             continue
         p1, p2 = cell_xy(na.r, na.c), cell_xy(nb.r, nb.c)
         c = ctrl_point(p1, p2, a, b)
-        hot = max(0.0, 1 - (tick - max(na.fired_at, nb.fired_at)) / 5)
+        hot = max(0.0, 1 - (tick - max(na.fired_at, nb.fired_at)) / HOT_LINK)
         if focus is not None and focus in (a, b):
             col = (C_FOCUS[0], C_FOCUS[1], C_FOCUS[2], 230)
             width = 2
@@ -836,7 +839,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
     glow.fill((0, 0, 0))
     for n in brain.neurons.values():
         x, y = cell_xy(n.r, n.c)
-        hot = max(0.0, 1 - (tick - n.fired_at) / 6)
+        hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
         if n.id == focus or n.id in nbrs:
             hot = max(hot, 0.6)                  # соседи выбранного нейрона светятся
         base = node_base(brain, n)
@@ -861,7 +864,7 @@ def draw_scene(screen, brain, layers, fonts, cache, stars, now, focus=None, info
 
     for n in brain.neurons.values():
         x, y = cell_xy(n.r, n.c)
-        hot = max(0.0, 1 - (tick - n.fired_at) / 6)
+        hot = max(0.0, 1 - (tick - n.fired_at) / HOT_NODE)
         base = node_base(brain, n)
         core = tuple(min(255, int(v + (255 - v) * hot)) for v in base)
         R = (5 if n.word else 3) + 2 * hot
@@ -1045,6 +1048,12 @@ def draw_chat(screen, thoughts, chat, text, fonts, now, progress, sliders, scrol
                 (INPUT_RECT.x + 12, INPUT_RECT.y + 10))
 
 
+def speech(words, entry, now, gap, live=False):
+    """Состояние озвучивания: слова по одному подсвечивают нейроны."""
+    return {"words": list(words), "start": now, "shown": 0, "prev": None,
+            "entry": entry, "gap": gap, "live": live}
+
+
 # ---------- главный цикл ----------
 
 def main():
@@ -1079,6 +1088,7 @@ def main():
         brain = Brain()
         status = "Новая сеть."
     mind = Mind(brain)
+    answerer = Answerer(brain, mind)
     sliders = [
         Slider("частота мыслей", 50, lambda v: f"каждые {think_sec(v):.2f} с"),
         Slider("длина ответа", 8, lambda v: f"{int(round(v))} слов"),
@@ -1137,6 +1147,7 @@ def main():
                     if msg == "/reset":
                         brain = Brain()
                         mind = Mind(brain)
+                        answerer = Answerer(brain, mind)
                         cache.clear()
                         resp = None
                         last_answer = None
@@ -1148,6 +1159,7 @@ def main():
                         if os.path.exists(SAVE_PATH):
                             brain = load_brain()
                             mind = Mind(brain)
+                            answerer = Answerer(brain, mind)
                             cache.clear()
                             resp = None
                             last_answer = None
@@ -1251,43 +1263,46 @@ def main():
                         scroll["chat"] = 0
                         cur = tokenize(msg, limit=None)
                         brain.train_words(prev_q[-3:] + cur)     # контекст диалога тоже учится
-                        ids = [brain.words[w] for w in cur if w in brain.words]
                         prev_q = last_q = cur
                         last_user_msg = msg
-                        words, conf = mind.answer(ids, target=int(round(sliders[1].value)))
+                        target = max(1, int(round(sliders[1].value)))
                         msg_count += 1
                         if msg_count % REGROUP_EVERY == 0:
                             brain.regroup()
                         recalled = episodes.recall(msg, k=2)
-                        entry = ["net", ""]
+                        entry = ["net", "думаю…"]
                         chat.append(entry)
-                        if lm is not None:
-                            memory = [f"«{ep['q']}» → «{ep['a']}»"
-                                      for sim, ep in recalled if sim >= RECALL_WEAK]
-                            ctx = words if conf >= mind.conf_min else []
-                            req = lm.submit(msg, ctx, memory)
-                            pending = {"req": req, "entry": entry, "q": msg,
-                                       "words": words, "conf": conf}
-                            entry[1] = "думаю…"
-                        elif recalled and recalled[0][0] >= RECALL_STRONG:
-                            sim, ep = recalled[0]
-                            count = max(1, int(round(sliders[1].value)))
-                            shown = ep["a"].split()[:count]
-                            last_answer = tokenize(" ".join(shown), limit=None) or None
-                            sys_msg(f"Вспомнила похожий вопрос (сходство {sim:.2f}).")
-                            resp = {"words": shown, "start": now, "shown": 0, "prev": None,
-                                    "entry": entry, "gap": gap_sec(sliders[2].value),
-                                    "live": False}
-                        elif words:
-                            if conf < mind.conf_min:
-                                sys_msg(f"Уверенность низкая ({conf:.2f}). Если ответ неверный, "
-                                        "напишите /teach правильный ответ.")
-                            last_answer = words
-                            resp = {"words": words, "start": now, "shown": 0, "prev": None,
-                                    "entry": entry, "gap": gap_sec(sliders[2].value),
-                                    "live": False}
+                        gap = gap_sec(sliders[2].value)
+                        if lm is None and recalled and recalled[0][0] >= RECALL_STRONG:
+                            # граф без LM: проверенный прошлый ответ
+                            ep = recalled[0][1]
+                            st = answerer.begin(msg, target)     # мысль сети строится всегда
+                            if st["thought"] is not None:
+                                thoughts.append(["thought", st["thought"].describe()])
+                                thoughts = thoughts[-300:]
+                            answerer.learn(msg, tokenize(ep["a"], limit=None))  # подтверждённое закрепляем
+                            last_answer = tokenize(ep["a"], limit=None) or None
+                            resp = speech(ep["a"].split(), entry, now, gap)
                         else:
-                            entry[1] = "пока не знаю этого. Научите: /teach ответ"
+                            st = answerer.begin(msg, target)
+                            if st["thought"] is not None:
+                                thoughts.append(["thought", st["thought"].describe()])
+                                thoughts = thoughts[-300:]
+                            if lm is not None:
+                                memory = [f"«{ep['q']}» → «{ep['a']}»"
+                                          for sim, ep in recalled if sim >= RECALL_WEAK]
+                                q_req, note, remember = answerer.request(st)
+                                req = lm.submit(q_req, (), memory, note, remember)
+                                pending = {"req": req, "entry": entry, "state": st}
+                            else:
+                                final = answerer.final(st)
+                                if final:
+                                    reply_text, score, _ = final
+                                    last_answer = tokenize(reply_text, limit=None) or None
+                                    last_support = score
+                                    resp = speech(reply_text.split(), entry, now, gap)
+                                else:
+                                    entry[1] = "пока не знаю этого. Научите: /teach ответ"
                     chat = chat[-300:]
                 elif e.key in (pygame.K_PAGEUP, pygame.K_PAGEDOWN):
                     k = "think" if pygame.key.get_mods() & pygame.KMOD_SHIFT else "chat"
@@ -1326,32 +1341,30 @@ def main():
 
         if lm is not None and pending is not None:
             partial_text = lm.partial(pending["req"])
-            if partial_text:                       # текст появляется по мере генерации
+            if partial_text:
                 pending["entry"][1] = partial_text
             res = lm.poll(pending["req"])
             if res is not None:
-                pend, pending = pending, None
-                if res:
-                    last_lm = (pend["q"], res)
-                    shown = res.split()
-                    last_answer = tokenize(res, limit=None) or None
-                    last_support = mind.support(last_q, last_answer or [])
-                    pend["entry"][1] = res
-                    live = True
+                st = pending["state"]
+                if answerer.feed(st, res):                      # перепроверка: переписываем
+                    q_req, note, remember = answerer.request(st)
+                    pending["req"] = lm.submit(q_req, (), (), note, remember)
+                    pending["entry"][1] = "перепроверяю…"
                 else:
-                    last_lm = None
-                    shown = pend["words"]
-                    last_answer = shown or None
-                    live = False
-                    if shown and pend["conf"] < mind.conf_min:
-                        sys_msg(f"Уверенность низкая ({pend['conf']:.2f}). Если ответ неверный, "
-                                "напишите /teach правильный ответ.")
-                if shown:
-                    resp = {"words": shown, "start": now, "shown": 0, "prev": None,
-                            "entry": pend["entry"], "gap": gap_sec(sliders[2].value),
-                            "live": live}
-                else:
-                    pend["entry"][1] = "пока не знаю этого. Научите: /teach ответ"
+                    entry_ref = pending["entry"]
+                    pending = None
+                    final = answerer.final(st)
+                    if final:
+                        reply_text, score, from_lm = final
+                        last_support = score
+                        last_answer = tokenize(reply_text, limit=None) or None
+                        if from_lm:
+                            last_lm = (st["q"], reply_text)
+                        entry_ref[1] = reply_text
+                        resp = speech(reply_text.split(), entry_ref, now,
+                                      gap_sec(sliders[2].value), live=True)
+                    else:
+                        entry_ref[1] = "пока не знаю этого. Научите: /teach ответ"
 
         progress = None
         if resp is not None:
@@ -1372,8 +1385,7 @@ def main():
             done = resp["shown"] == len(words)
             if not resp.get("live"):
                 resp["entry"][1] = " ".join(words[:resp["shown"]]) + ("" if done else " …")
-            progress = (min(1.0, elapsed / total),
-                        f"Сеть говорит: {resp['shown']}/{len(words)} слов")
+            progress = None                          # служебный прогресс скрыт
             if done and elapsed >= total:
                 resp = None
 
